@@ -145,6 +145,7 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
+
 # Pyre type checker
 .pyre/
 
@@ -162,3 +163,4 @@ cython_debug/
 .idea/
 
 data_rivers/
+river_analysis_naudojantkituspoint.py/
