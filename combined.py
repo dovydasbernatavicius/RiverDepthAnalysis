@@ -5,13 +5,13 @@ import rasterio
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 import xgboost as xgb
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import cross_val_score, LeaveOneGroupOut
+from sklearn.model_selection import cross_val_score
 from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
-import seaborn as sns
-import joblib
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 
 # Define the base directory for river data
 BASE_DIR = r"C:\Users\dober\PycharmProjects\RiverDepthAnalysis\data_rivers"
@@ -19,7 +19,7 @@ BASE_DIR = r"C:\Users\dober\PycharmProjects\RiverDepthAnalysis\data_rivers"
 # River folders and their respective band file names
 river_data = {
     "jura": {
-        "shp_file": "Jura-1.01-dv_SHP-230713.shp",
+        "shp_file": "Jura-1.01-dv_SHP-230713.shp",  # Updated for Jura
         "bands": [
             "Jura-1.01-nir-230713.tif",
             "Jura-1.01-orto-230713.tif",
@@ -28,7 +28,7 @@ river_data = {
         ]
     },
     "musa": {
-        "shp_file": "Musa-0.548-dv_SHP-230711.shp",
+        "shp_file": "Musa-0.548-dv_SHP-230711.shp",  # Updated for Musa
         "bands": [
             "Musa-0.548-nir-230711.tif",
             "Musa-0.548-orto-230711.tif",
@@ -37,7 +37,7 @@ river_data = {
         ]
     },
     "verkne": {
-        "shp_file": "Verkne-1.42-dv_SHP-230718.shp",
+        "shp_file": "Verkne-1.42-dv_SHP-230718.shp",  # Updated for Verkne
         "bands": [
             "Verkne-1.42-nir-230718.tif",
             "Verkne-1.42-orto-230718.tif",
@@ -47,161 +47,180 @@ river_data = {
     }
 }
 
-# Load data function
-def load_data(river_data, base_dir):
-    global_X, global_y, coordinates, groups = [], [], [], []
+# Train the model once and then make predictions
+print("Training the models...")
 
-    for river_idx, (river_name, river_info) in enumerate(river_data.items()):
-        shp_path = os.path.join(base_dir, f"data_{river_name}", river_info["shp_file"])
-        band_paths = [os.path.join(base_dir, f"data_{river_name}", band) for band in river_info["bands"]]
+# Combine all river data for training
+global_X = []
+global_y = []
+coordinates = []
 
-        # Load the shapefile using geopandas
-        gdf = gpd.read_file(shp_path)
-        depth_column_name = 'Depth'
+for river_name, river_info in river_data.items():
+    # Construct the path to the shapefile and bands
+    shp_path = os.path.join(BASE_DIR, f"data_{river_name}", river_info["shp_file"])
+    band_paths = [os.path.join(BASE_DIR, f"data_{river_name}", band) for band in river_info["bands"]]
 
-        # Filter valid geometries with depth values
-        valid_geometries = gdf[gdf[depth_column_name].notnull()]
+    # Load the shapefile using geopandas
+    print(f"Loading shapefile from: {shp_path}")
+    gdf = gpd.read_file(shp_path)
 
-        if not valid_geometries.empty:
-            band_data_list = [rasterio.open(band).read(1) for band in band_paths]
+    # Define the depth column name as it appears in your shapefile
+    depth_column_name = 'Depth'
 
-            for geometry, depth in zip(valid_geometries.geometry, valid_geometries[depth_column_name]):
-                if geometry.geom_type == 'Point':
-                    intensities = []
-                    for i, band_data in enumerate(band_data_list):
-                        row, col = rasterio.open(band_paths[i]).index(geometry.x, geometry.y)
-                        intensities.append(band_data[row, col])
-                    global_X.append(intensities)
-                    global_y.append(depth)
-                    coordinates.append((geometry.x, geometry.y))
-                    groups.append(river_idx)
+    # Filter out geometries that have no depth value
+    valid_geometries = gdf[gdf[depth_column_name].notnull()]
 
-    return np.array(global_X), np.array(global_y), np.array(coordinates), np.array(groups)
+    # Ensure there are valid geometries with depth values
+    if not valid_geometries.empty:
+        # Open the bands once and store them in memory
+        band_data_list = []
+        for band_path in band_paths:
+            with rasterio.open(band_path) as src:
+                band_data_list.append(src.read(1))
 
-# Train and evaluate model using LeaveOneGroupOut
-def evaluate_model_with_logo(model, X, y, groups):
-    logo = LeaveOneGroupOut()
-    mae_scores, rmse_scores, r2_scores = [], [], []
+        # Now, collect data points from all available valid geometries
+        for geometry, depth in zip(valid_geometries.geometry, valid_geometries[depth_column_name]):
+            if geometry.geom_type == 'Point':
+                intensities_for_geometry = []
+                for i, band_data in enumerate(band_data_list):
+                    row, col = rasterio.open(band_paths[i]).index(geometry.x, geometry.y)
+                    intensities_for_geometry.append(band_data[row, col])
+                global_X.append(intensities_for_geometry)
+                global_y.append(depth)
+                coordinates.append((geometry.x, geometry.y))
 
-    for train_idx, test_idx in logo.split(X, y, groups=groups):
-        model.fit(X[train_idx], y[train_idx])
-        predictions = model.predict(X[test_idx])
-        mae_scores.append(mean_absolute_error(y[test_idx], predictions))
-        rmse_scores.append(np.sqrt(mean_squared_error(y[test_idx], predictions)))
-        r2_scores.append(r2_score(y[test_idx], predictions))
+# Convert global lists to numpy arrays
+global_X = np.array(global_X)
+global_y = np.array(global_y)
+coordinates = np.array(coordinates)
 
-    return np.mean(mae_scores), np.mean(rmse_scores), np.mean(r2_scores)
-
-# Benchmark comparison using average depth as baseline
-def benchmark(y):
-    mean_depth = np.mean(y)
-    return mean_absolute_error(y, [mean_depth] * len(y))
-
-# Plot feature importance
-def plot_feature_importance(model, feature_names, title):
-    if hasattr(model, 'feature_importances_'):
-        importance = model.feature_importances_
-        sns.barplot(x=feature_names, y=importance)
-        plt.title(title)
-        plt.xlabel("Feature")
-        plt.ylabel("Importance")
-        plt.show()
-
-# Main processing and enhancements
-global_X, global_y, coordinates, groups = load_data(river_data, BASE_DIR)
-
-# Normalize data
+# Normalize input data
 scaler = StandardScaler()
 global_X = scaler.fit_transform(global_X)
 
-# Define models
-model_rf = RandomForestRegressor(n_estimators=1000, n_jobs=-1)
-model_xgb = xgb.XGBRegressor(objective='reg:squarederror', max_depth=8, learning_rate=0.03, n_estimators=300, subsample=0.8, n_jobs=-1)
+# Train models on the full dataset
+# Model 1: Random Forest Regression
+model_rf = RandomForestRegressor(n_estimators=1000, n_jobs=-1)  # Increased number of trees to 1000 for higher precision
+model_rf.fit(global_X, global_y)
 
-# Train and cross-validate models
-rf_mae, rf_rmse, rf_r2 = evaluate_model_with_logo(model_rf, global_X, global_y, groups)
-xgb_mae, xgb_rmse, xgb_r2 = evaluate_model_with_logo(model_xgb, global_X, global_y, groups)
+# Cross-validation for Random Forest
+rf_cv_scores = cross_val_score(model_rf, global_X, global_y, cv=5, scoring='neg_mean_absolute_error')
+print(f"Cross-Validation MAE for Random Forest: {-np.mean(rf_cv_scores):.4f} +/- {np.std(rf_cv_scores):.4f}")
 
-# Print benchmark and cross-validation results
-benchmark_mae = benchmark(global_y)
-print("Benchmark MAE (Mean Depth):")
-print(f"{benchmark_mae:.4f}")
-print("Random Forest MAE:")
-print(f"MAE={rf_mae:.4f}")
-print("Random Forest RMSE:")
-print(f"RMSE={rf_rmse:.4f}")
-print("Random Forest R²:")
-print(f"R²={rf_r2:.4f}")
-print("XGBoost MAE:")
-print(f"MAE={xgb_mae:.4f}")
-print("XGBoost RMSE:")
-print(f"RMSE={xgb_rmse:.4f}")
-print("XGBoost R²:")
-print(f"R²={xgb_r2:.4f}")
+# Model 2: XGBoost Regression
+model_xgb = xgb.XGBRegressor(objective='reg:squarederror', max_depth=8, learning_rate=0.03, n_estimators=300,
+                             subsample=0.8, n_jobs=-1)  # Adjusted hyperparameters for better performance
+model_xgb.fit(global_X, global_y)
 
-# Plot feature importance
-plot_feature_importance(model_rf, feature_names=[f'Band {i+1}' for i in range(global_X.shape[1])], title='Random Forest Feature Importance')
-plot_feature_importance(model_xgb, feature_names=[f'Band {i+1}' for i in range(global_X.shape[1])], title='XGBoost Feature Importance')
+# Cross-validation for XGBoost
+xgb_cv_scores = cross_val_score(model_xgb, global_X, global_y, cv=5, scoring='neg_mean_absolute_error')
+print(f"Cross-Validation MAE for XGBoost: {-np.mean(xgb_cv_scores):.4f} +/- {np.std(xgb_cv_scores):.4f}")
 
-# Save models
-joblib.dump(model_rf, "random_forest_model.pkl")
-joblib.dump(model_xgb, "xgboost_model.pkl")
+# Model 3: Gaussian Process Regression for Interpolation
+kernel = C(1.0, (1e-3, 1e3)) * RBF(10, (1e-2, 1e2))
+model_gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
+model_gp.fit(coordinates, global_y)
 
-# Interpolate and plot riverbed depth
-grid_x, grid_y = np.mgrid[coordinates[:, 0].min():coordinates[:, 0].max():1000j,
-                          coordinates[:, 1].min():coordinates[:, 1].max():1000j]
-interpolated_depth = griddata(coordinates, global_y, (grid_x, grid_y), method='cubic')
-interpolated_depth = np.clip(interpolated_depth, 0, 4)
+successful_predictions = 0
 
-plt.figure(figsize=(12, 8))
-plt.contourf(grid_x, grid_y, interpolated_depth, cmap='viridis', levels=50)
-plt.scatter(coordinates[:, 0], coordinates[:, 1], c=global_y, cmap='coolwarm', edgecolor='k', s=20)
-plt.colorbar(label='Interpolated Depth (m)')
-plt.xlabel('X Coordinate')
-plt.ylabel('Y Coordinate')
-plt.title('Interpolated Riverbed Depth Contour')
-plt.show()
+# Predict depth at random points 10 times
+for i in range(1):
+    # Randomly select a river for prediction
+    selected_river = random.choice(list(river_data.keys()))
+    river_info = river_data[selected_river]
 
-# Random river prediction
-selected_river = random.choice(list(river_data.keys()))
-river_info = river_data[selected_river]
-shp_path = os.path.join(BASE_DIR, f"data_{selected_river}", river_info["shp_file"])
-band_paths = [os.path.join(BASE_DIR, f"data_{selected_river}", band) for band in river_info["bands"]]
-gdf = gpd.read_file(shp_path)
-depth_column_name = 'Depth'
-valid_geometries = gdf[gdf[depth_column_name].notnull()]
+    # Construct the path to the shapefile and bands
+    shp_path = os.path.join(BASE_DIR, f"data_{selected_river}", river_info["shp_file"])
+    band_paths = [os.path.join(BASE_DIR, f"data_{selected_river}", band) for band in river_info["bands"]]
 
-if not valid_geometries.empty:
-    selected_geometry = valid_geometries.sample(n=1).geometry.values[0]
-    if selected_geometry.geom_type == 'Point':
-        selected_point = selected_geometry
+    # Load the shapefile using geopandas
+    gdf = gpd.read_file(shp_path)
 
-    selected_depth = valid_geometries.loc[valid_geometries.geometry == selected_geometry, depth_column_name].values[0]
-    band_data_list = [rasterio.open(band).read(1) for band in band_paths]
-    intensities = [band[row, col] for band in band_data_list for row, col in [rasterio.open(band_paths[0]).index(selected_point.x, selected_point.y)]]
-    intensities = scaler.transform([intensities])[0]
+    # Filter out geometries that have no depth value
+    valid_geometries = gdf[gdf[depth_column_name].notnull()]
 
-    predicted_depth_rf = model_rf.predict([intensities])[0]
-    predicted_depth_xgb = model_xgb.predict([intensities])[0]
-    mae_rf = mean_absolute_error([selected_depth], [predicted_depth_rf])
-    mae_xgb = mean_absolute_error([selected_depth], [predicted_depth_xgb])
+    # Ensure there are valid geometries with depth values
+    if not valid_geometries.empty:
+        # Randomly select a valid point from the filtered geometries
+        selected_geometry = valid_geometries.sample(n=1).geometry.values[0]
 
-    print("-------------------------------------------------")
-    print(f"Benchmark MAE (Mean Depth): {benchmark_mae:.4f}")
-    print(f"Random Forest MAE: {rf_mae:.4f}")
-    print(f"Random Forest RMSE: {rf_rmse:.4f}")
-    print(f"Random Forest R²: {rf_r2:.4f}")
-    print(f"XGBoost MAE: {xgb_mae:.4f}")
-    print(f"XGBoost RMSE: {xgb_rmse:.4f}")
-    print(f"XGBoost R²: {xgb_r2:.4f}")
-    print("-------------------------------------------------")
-    print(f"Selected River: {selected_river.capitalize()}")
-    print(f"Actual Depth: {selected_depth:.4f}")
-    print(f"Random Forest Predicted Depth: {predicted_depth_rf:.4f}")
-    print(f"XGBoost Predicted Depth: {predicted_depth_xgb:.4f}")
-    print(f"Random Forest MAE: {mae_rf:.4f}")
-    print(f"XGBoost MAE: {mae_xgb:.4f}")
-    print("-------------------------------------------------")
+        # Extract coordinates based on geometry type
+        if selected_geometry.geom_type == 'Point':
+            selected_point = selected_geometry
+        elif selected_geometry.geom_type in ['LineString', 'Polygon']:
+            selected_point = selected_geometry.coords[
+                0] if selected_geometry.geom_type == 'LineString' else random.choice(
+                list(selected_geometry.exterior.coords))
+        else:
+            print("Unsupported geometry type.")
+            continue
 
-else:
-    print("No valid geometries with depth information found.")
+        # Get the actual depth value at the selected point
+        selected_depth = valid_geometries.loc[valid_geometries.geometry == selected_geometry, depth_column_name].values[
+            0]
+
+        # Print selected river, point, and depth
+        print(f"Selected river: {selected_river.capitalize()}")
+        print(f"Selected point: {selected_point.x}, {selected_point.y}")
+        print(f"Actual Depth at selected point: {selected_depth}")
+
+        # Open the bands once and store them in memory
+        band_data_list = []
+        for band_path in band_paths:
+            with rasterio.open(band_path) as src:
+                band_data_list.append(src.read(1))
+
+        # Extract pixel intensities for each of the four bands at the selected point
+        intensities = []
+        for i, band_data in enumerate(band_data_list):
+            row, col = rasterio.open(band_paths[i]).index(selected_point.x, selected_point.y)
+            intensities.append(band_data[row, col])
+
+        # Normalize the features for prediction
+        intensities = scaler.transform([intensities])[0]
+
+        # Predict depth using the trained models
+        predicted_depth_rf = model_rf.predict([intensities])[0]
+        predicted_depth_xgb = model_xgb.predict([intensities])[0]
+        predicted_depth_gp = model_gp.predict([[selected_point.x, selected_point.y]])[0]
+
+        # Print predictions
+        print(f"Predicted Depth (Random Forest) at selected point: {predicted_depth_rf}")
+        print(f"Predicted Depth (XGBoost) at selected point: {predicted_depth_xgb}")
+        print(f"Predicted Depth (Gaussian Process Interpolation) at selected point: {predicted_depth_gp}")
+
+        # Calculate and print MAE for the selected point
+        mae_rf = mean_absolute_error([selected_depth], [predicted_depth_rf])
+        mae_xgb = mean_absolute_error([selected_depth], [predicted_depth_xgb])
+        mae_gp = mean_absolute_error([selected_depth], [predicted_depth_gp])
+        print(f"Mean Absolute Error (Random Forest) for selected point: {mae_rf:.4f}")
+        print(f"Mean Absolute Error (XGBoost) for selected point: {mae_xgb:.4f}")
+        print(f"Mean Absolute Error (Gaussian Process Interpolation) for selected point: {mae_gp:.4f}")
+
+        # Interpolation around the selected point
+        point_buffer = 50  # Buffer size for interpolation grid around the point
+        point_grid_x, point_grid_y = np.mgrid[(selected_point.x - point_buffer):(selected_point.x + point_buffer):100j,
+                                     (selected_point.y - point_buffer):(selected_point.y + point_buffer):100j]
+        interpolated_point_depth = griddata(coordinates, global_y, (point_grid_x, point_grid_y), method='cubic')
+        interpolated_point_depth = np.clip(interpolated_point_depth, 0, 4)
+
+        # Plot the interpolation around the selected point
+        print(f"Plotting interpolation using scipy's griddata...")
+
+        plt.figure(figsize=(8, 6))
+        plt.contourf(point_grid_x, point_grid_y, interpolated_point_depth, cmap='viridis', levels=50)
+        plt.scatter([selected_point.x], [selected_point.y], c='red', marker='x', s=100, label='Selected Point')
+        plt.colorbar(label='Interpolated Depth (m)')
+        plt.xlabel('X Coordinate')
+        plt.ylabel('Y Coordinate')
+        plt.title(f'Detailed Interpolation Around Selected Point (Prediction {i + 1})')
+        plt.legend()
+        plt.show()
+
+        successful_predictions += 1
+
+    else:
+        print("No valid geometries with depth information found.")
+
+# Summary of predictions
+print(f"Successful predictions: {successful_predictions}/10")
