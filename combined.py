@@ -105,21 +105,21 @@ scaler = StandardScaler()
 global_X = scaler.fit_transform(global_X)
 
 # Train models on the full dataset
-# Model 1: Random Forest Regression
-model_rf = RandomForestRegressor(n_estimators=300, n_jobs=-1, max_depth=15, random_state=42)  # Reduced number of trees for faster computation
+# Model 1: Random Forest Regression (increased estimators and max depth for better accuracy)
+model_rf = RandomForestRegressor(n_estimators=1500, n_jobs=-1, max_depth=30, min_samples_split=2, min_samples_leaf=1, random_state=42)  # Increased complexity for higher accuracy
 model_rf.fit(global_X, global_y)
 
 # Cross-validation for Random Forest
-rf_cv_scores = cross_val_score(model_rf, global_X, global_y, cv=3, scoring='neg_mean_absolute_error', n_jobs=-1)
+rf_cv_scores = cross_val_score(model_rf, global_X, global_y, cv=10, scoring='neg_mean_absolute_error', n_jobs=-1)  # Increased CV folds for better generalization
 print(f"Cross-Validation MAE for Random Forest: {-np.mean(rf_cv_scores):.4f} +/- {np.std(rf_cv_scores):.4f}")
 
-# Model 2: XGBoost Regression
-model_xgb = xgb.XGBRegressor(objective='reg:squarederror', max_depth=6, learning_rate=0.05, n_estimators=200,
-                             subsample=0.8, n_jobs=-1, random_state=42)  # Adjusted hyperparameters for better performance and reduced computation time
+# Model 2: XGBoost Regression (increased n_estimators and adjusted learning rate)
+model_xgb = xgb.XGBRegressor(objective='reg:squarederror', max_depth=15, learning_rate=0.01, n_estimators=1000,
+                             subsample=0.95, colsample_bytree=0.9, n_jobs=-1, random_state=42)  # Increased n_estimators and adjusted hyperparameters for better performance
 model_xgb.fit(global_X, global_y)
 
 # Cross-validation for XGBoost
-xgb_cv_scores = cross_val_score(model_xgb, global_X, global_y, cv=3, scoring='neg_mean_absolute_error', n_jobs=-1)
+xgb_cv_scores = cross_val_score(model_xgb, global_X, global_y, cv=10, scoring='neg_mean_absolute_error', n_jobs=-1)  # Increased CV folds for better generalization
 print(f"Cross-Validation MAE for XGBoost: {-np.mean(xgb_cv_scores):.4f} +/- {np.std(xgb_cv_scores):.4f}")
 
 successful_predictions = 0
@@ -181,6 +181,10 @@ if not valid_geometries.empty:
     predicted_depth_rf = model_rf.predict([intensities])[0]
     predicted_depth_xgb = model_xgb.predict([intensities])[0]
 
+    # Calculate benchmark (average depth of the river)
+    avg_depth = valid_geometries[depth_column_name].mean()
+    print(f"Benchmark Average Depth at selected point: {avg_depth:.4f}")
+
     # Print predictions
     print(f"Predicted Depth (Random Forest) at selected point: {predicted_depth_rf}")
     print(f"Predicted Depth (XGBoost) at selected point: {predicted_depth_xgb}")
@@ -188,8 +192,10 @@ if not valid_geometries.empty:
     # Calculate and print MAE for the selected point
     mae_rf = mean_absolute_error([selected_depth], [predicted_depth_rf])
     mae_xgb = mean_absolute_error([selected_depth], [predicted_depth_xgb])
+    mae_avg = mean_absolute_error([selected_depth], [avg_depth])
     print(f"Mean Absolute Error (Random Forest) for selected point: {mae_rf:.4f}")
     print(f"Mean Absolute Error (XGBoost) for selected point: {mae_xgb:.4f}")
+    print(f"Mean Absolute Error (Benchmark - Average Depth) for selected point: {mae_avg:.4f}")
 
     successful_predictions += 1
 
