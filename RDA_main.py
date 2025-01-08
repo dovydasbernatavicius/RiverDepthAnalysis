@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import rasterio
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler
@@ -95,6 +97,7 @@ river_data = {
     ]
 }
 
+# --------------------------------------------------------------------------
 def check_files_exist():
     """Check that each shapefile/band actually exists."""
     missing_files = False
@@ -118,13 +121,62 @@ def check_files_exist():
     return True
 
 # --------------------------------------------------------------------------
-# HELPER: AVERAGE A large NEIGHBORHOOD
+# HELPER: gather multiple sub-pixels around (row_center, col_center)
+# --------------------------------------------------------------------------
+def collect_local_pixels(band_arrays, row_center, col_center, radius=300, n_samples=200):
+    """
+    Collect up to n_samples random sub-pixels in a (2*radius+1) x (2*radius+1) box.
+    Each sub-pixel is [band_count] intensities, appended to the results list.
+    """
+    results = []
+    if not band_arrays:
+        return results
+
+    rows, cols = band_arrays[0].shape
+
+    rmin = max(0, row_center - radius)
+    rmax = min(rows, row_center + radius + 1)
+    cmin = max(0, col_center - radius)
+    cmax = min(cols, col_center + radius + 1)
+
+    box_height = rmax - rmin
+    box_width = cmax - cmin
+    total_box_pixels = box_height * box_width
+
+    # If region smaller than n_samples, just gather all
+    if total_box_pixels <= n_samples:
+        sub_indices = [
+            (r, c)
+            for r in range(rmin, rmax)
+            for c in range(cmin, cmax)
+        ]
+    else:
+        # random sample
+        sub_indices = []
+        for _ in range(n_samples):
+            rr = random.randint(rmin, rmax - 1)
+            cc = random.randint(cmin, cmax - 1)
+            sub_indices.append((rr, cc))
+
+    # For each sub-pixel
+    for (rr, cc) in sub_indices:
+        intensities = []
+        out_of_bounds = False
+        for band_data in band_arrays:
+            if 0 <= rr < band_data.shape[0] and 0 <= cc < band_data.shape[1]:
+                intensities.append(float(band_data[rr, cc]))
+            else:
+                out_of_bounds = True
+                break
+        if (not out_of_bounds) and len(intensities) == len(band_arrays):
+            results.append(intensities)
+
+    return results
+
+# --------------------------------------------------------------------------
+# HELPER 2: AVERAGE A large NEIGHBORHOOD (only used if needed)
 # --------------------------------------------------------------------------
 def average_patch(band_data, row, col, patch_size=3):
-    """
-    For each band_data (2D array), average the pixel intensities in a patch
-    of size (2*patch_size + 1) around (row, col). Default patch_size=3 => 7x7 region.
-    """
     rows, cols = band_data.shape
     rmin = max(0, row - patch_size)
     rmax = min(rows, row + patch_size + 1)
@@ -132,83 +184,131 @@ def average_patch(band_data, row, col, patch_size=3):
     cmax = min(cols, col + patch_size + 1)
 
     patch = band_data[rmin:rmax, cmin:cmax]
-    return float(np.mean(patch))  # average intensity
+    return float(np.mean(patch))
 
-def load_training_data(train_rivers, patch_size=3):
+# --------------------------------------------------------------------------
+# HELPER 3: For optional debugging (display 500x500)
+# --------------------------------------------------------------------------
+def display_cropped_bands(
+    band_arrays,
+    row_cols,
+    radius=300,
+    region_size=500
+):
     """
-    Load shapefiles + raster band data from the specified rivers (all their datasets).
-    For each geometry, gather a 'patch_size' region average intensities to reduce noise.
+    Show each band's image but only a 500x500 area around the center pixel.
+    We'll just place a red dot at the center. The radius-based approach
+    means we don't necessarily show the sub-pixel boxes. This is for debugging.
     """
+    import matplotlib.patches as patches
+
+    num_bands = len(band_arrays)
+    fig, axs = plt.subplots(1, num_bands, figsize=(15, 5))
+
+    for i, band_data in enumerate(band_arrays):
+        ax = axs[i] if num_bands > 1 else axs
+        row_idx, col_idx = row_cols[i]
+        H, W = band_data.shape
+
+        half = region_size // 2
+        row_start = max(0, row_idx - half)
+        col_start = max(0, col_idx - half)
+        row_end = min(H, row_start + region_size)
+        col_end = min(W, col_start + region_size)
+        row_start = max(0, row_end - region_size)
+        col_start = max(0, col_end - region_size)
+
+        cropped = band_data[row_start:row_end, col_start:col_end]
+        ax.imshow(cropped, cmap='gray')
+
+        local_row = row_idx - row_start
+        local_col = col_idx - col_start
+
+        # Red dot for center
+        ax.scatter(local_col, local_row, c='red', s=30)
+
+        ax.set_title(f"Band {i+1}")
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+# --------------------------------------------------------------------------
+# TRAINING: multi-sub-pixel approach
+# --------------------------------------------------------------------------
+def load_training_data(
+    train_rivers,
+    radius=300,    # gather sub-pixels in 300-pixel radius
+    n_samples=200  # # sub-pixels to sample
+):
     global_X = []
     global_y = []
 
     for river_name in train_rivers:
-        for dataset in river_data.get(river_name, []):
+        datasets = river_data.get(river_name, [])
+        for dataset in datasets:
             shp_file = dataset["shp_file"]
             band_list = dataset["bands"]
 
             shp_path = os.path.join(BASE_DIR, f"data_{river_name}", shp_file)
             if not os.path.isfile(shp_path):
-                print(f"[WARNING] Shapefile missing: {shp_path}")
                 continue
 
-            # Read the shapefile
             gdf = gpd.read_file(shp_path)
             if "Depth" not in gdf.columns:
-                print(f"[WARNING] No 'Depth' column in {shp_file}. Skipping...")
                 continue
-
             valid_gdf = gdf[gdf["Depth"].notnull()]
             if valid_gdf.empty:
-                print(f"[WARNING] All Depth values are null in {shp_file}. Skipping...")
                 continue
 
-            # Load band data in memory
+            # load bands
             band_arrays = []
-            band_transforms = []
+            transforms = []
+            widths = []
+            heights = []
             for band_file in band_list:
                 band_path = os.path.join(BASE_DIR, f"data_{river_name}", band_file)
                 with rasterio.open(band_path) as src:
                     band_arrays.append(src.read(1))
-                    band_transforms.append((src.transform, src.width, src.height))
+                    transforms.append(src.transform)
+                    widths.append(src.width)
+                    heights.append(src.height)
 
-            # For each geometry, get the average intensity in a patch
-            for idx, row_data in valid_gdf.iterrows():
+            # For each geometry
+            for _, row_data in valid_gdf.iterrows():
                 geom = row_data.geometry
                 depth_val = row_data["Depth"]
                 if geom is None or geom.is_empty or geom.geom_type != 'Point':
                     continue
 
                 x_coord, y_coord = geom.x, geom.y
-                intensities = []
-                out_of_bounds = False
+                # transform => pixel
+                transform_1 = transforms[0]
+                w_1 = widths[0]
+                h_1 = heights[0]
 
-                for i, band_data in enumerate(band_arrays):
-                    transform, w, h = band_transforms[i]
-                    col, row_idx = ~transform * (x_coord, y_coord)
-                    row_idx = int(round(row_idx))
-                    col = int(round(col))
+                col, row_idx = ~transform_1 * (x_coord, y_coord)
+                row_idx = int(round(row_idx))
+                col = int(round(col))
 
-                    # Check if the center is within the raster
-                    if 0 <= row_idx < h and 0 <= col < w:
-                        avg_val = average_patch(band_data, row_idx, col, patch_size=patch_size)
-                        intensities.append(avg_val)
-                    else:
-                        out_of_bounds = True
-                        break
-
-                if not out_of_bounds:
-                    global_X.append(intensities)
-                    global_y.append(depth_val)
+                # If in range
+                if 0 <= row_idx < h_1 and 0 <= col < w_1:
+                    local_pixels = collect_local_pixels(
+                        band_arrays, row_idx, col,
+                        radius=radius,
+                        n_samples=n_samples
+                    )
+                    # each sub-pixel is appended
+                    for feats in local_pixels:
+                        global_X.append(feats)
+                        global_y.append(depth_val)
 
     return np.array(global_X), np.array(global_y)
 
-def load_test_data(test_river, patch_size=3):
-    """
-    Combines all shapefiles for 'test_river' into one GeoDataFrame,
-    plus parallel band arrays. Then we do the patch-based average
-    in the predict_random_point function.
-    """
+# --------------------------------------------------------------------------
+# TEST LOADING
+# --------------------------------------------------------------------------
+def load_test_data(test_river):
     import pandas as pd
 
     combined_gdf = gpd.GeoDataFrame()
@@ -216,7 +316,6 @@ def load_test_data(test_river, patch_size=3):
     list_of_band_info = []
 
     if test_river not in river_data:
-        print(f"[ERROR] Test river '{test_river}' not in dictionary.")
         return combined_gdf, list_of_band_data, list_of_band_info
 
     for dataset in river_data[test_river]:
@@ -225,7 +324,6 @@ def load_test_data(test_river, patch_size=3):
 
         shp_path = os.path.join(BASE_DIR, f"data_{test_river}", shp_file)
         if not os.path.isfile(shp_path):
-            print(f"[WARNING] Missing shapefile: {shp_path}")
             continue
 
         gdf = gpd.read_file(shp_path)
@@ -237,7 +335,6 @@ def load_test_data(test_river, patch_size=3):
         if not valid_gdf.empty:
             combined_gdf = pd.concat([combined_gdf, valid_gdf], ignore_index=True)
 
-        # Load bands
         band_arrays = []
         band_info = []
         for band_file in band_list:
@@ -248,42 +345,35 @@ def load_test_data(test_river, patch_size=3):
         list_of_band_data.append(band_arrays)
         list_of_band_info.append(band_info)
 
-    # Convert to GeoDataFrame if not already
     combined_gdf = gpd.GeoDataFrame(combined_gdf, geometry="geometry", crs=gdf.crs)
     return combined_gdf, list_of_band_data, list_of_band_info
 
-def train_models(X, y):
-    """
-    Aggressively overfit both RandomForest and XGBoost.
-    We skip cross-validation entirely to maximize training set fit.
-    """
-    # 1) Print naive average depth
+# --------------------------------------------------------------------------
+# TRAIN
+# --------------------------------------------------------------------------
+def train_models(X, y, n_estimators=300, max_depth=20):
     naive_depth = np.mean(y)
     print(f"[BENCHMARK] Training set average depth = {naive_depth:.4f}")
 
-    # 2) Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # 3) Overfit RandomForest
     rf_model = RandomForestRegressor(
-        n_estimators=2000,    # huge forest
-        max_depth=None,       # no depth limit -> can overfit
-        min_samples_split=2,
-        min_samples_leaf=1,
-        random_state=42,
-        n_jobs=-1
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        n_jobs=-1,
+        random_state=42
     )
     rf_model.fit(X_scaled, y)
 
-    # 4) Overfit XGBoost
     xgb_model = xgb.XGBRegressor(
         objective='reg:squarederror',
-        max_depth=50,           # very deep
-        learning_rate=0.005,    # smaller LR -> can overfit with enough rounds
-        n_estimators=3000,      # many boosting rounds
-        subsample=1.0,          # no row subsampling
-        colsample_bytree=1.0,   # no feature subsampling
+        max_depth=max_depth,
+        learning_rate=0.005,
+        n_estimators=n_estimators,
+        tree_method='hist',   # try a more memory-friendly approach
+        subsample=1.0,
+        colsample_bytree=1.0,
         random_state=42,
         n_jobs=-1
     )
@@ -291,125 +381,175 @@ def train_models(X, y):
 
     return rf_model, xgb_model, scaler, naive_depth
 
-def predict_random_point(
+
+# --------------------------------------------------------------------------
+# PREDICT: gather sub-pixels in a 300 px radius, average predictions
+# --------------------------------------------------------------------------
+def predict_random_point_subpixels(
     combined_gdf,
     list_of_band_data,
     list_of_band_info,
     rf_model,
     xgb_model,
     scaler,
-    patch_size=3,
+    radius=300,
+    n_samples=200,
     naive_depth=None,
     num_bands_expected=5
 ):
-    """Pick random geometry from test shapefile, average patch, predict, compare to naive depth."""
+    """
+    1) Random geometry from test shapefile
+    2) Gather multiple sub-pixels around that geometry
+    3) Predict each sub-pixel's depth
+    4) Average predictions for final result
+    """
     from sklearn.metrics import mean_absolute_error
 
     if combined_gdf.empty:
-        print("[ERROR] Test shapefile has no valid Depth data.")
+        print("[ERROR] No valid Depth data for test.")
         return
 
+    # pick random geometry
     selected_row = combined_gdf.sample(n=1).iloc[0]
     geom = selected_row.geometry
-    if geom is None or geom.is_empty or geom.geom_type != 'Point':
+    if not geom or geom.is_empty or geom.geom_type != 'Point':
         print("[WARNING] Invalid geometry. Skipping.")
         return
 
     x_coord, y_coord = geom.x, geom.y
-    actual_depth = selected_row.get('Depth', None)
+    actual_depth = selected_row["Depth"]
+    print("\n[TEST: Sub-Pixel Approach] Coordinates: (%.3f, %.3f)" % (x_coord, y_coord))
+    print("   Actual Depth:", actual_depth)
 
-    print("\n[TEST] Random geometry from test river:")
-    print(f"   Coordinates: ({x_coord:.3f}, {y_coord:.3f})")
-    print(f"   Actual Depth: {actual_depth}")
+    # Identify coverage
+    subpixel_features = []
+    coverage_bands = None
+    coverage_row_cols = None
+    found_coverage = False
 
-    intensities = None
     for band_arrays, band_info in zip(list_of_band_data, list_of_band_info):
         if len(band_arrays) != num_bands_expected:
             continue
 
-        feat_vector = []
-        in_bounds = True
-        for i, band_data in enumerate(band_arrays):
-            transform, w, h = band_info[i]
-            col, row_idx = ~transform * (x_coord, y_coord)
-            row_idx = int(round(row_idx))
-            col = int(round(col))
+        # We'll do the transform from the first band
+        transform_1, w_1, h_1 = band_info[0]
+        col, row_idx = ~transform_1 * (x_coord, y_coord)
+        row_idx = int(round(row_idx))
+        col = int(round(col))
 
-            if 0 <= row_idx < h and 0 <= col < w:
-                avg_val = average_patch(band_data, row_idx, col, patch_size=patch_size)
-                feat_vector.append(avg_val)
+        if 0 <= row_idx < h_1 and 0 <= col < w_1:
+            # gather sub-pixels from all bands
+            # first, let's see if each band is big enough
+            for i, bd in enumerate(band_arrays):
+                if row_idx < 0 or row_idx >= bd.shape[0]:
+                    break
+                if col < 0 or col >= bd.shape[1]:
+                    break
             else:
-                in_bounds = False
-                break
+                # we have coverage
+                # gather sub-pixels for all bands
+                sub_pixels = collect_local_pixels(
+                    band_arrays,
+                    row_center=row_idx,
+                    col_center=col,
+                    radius=radius,
+                    n_samples=n_samples
+                )
+                if sub_pixels:
+                    # we store them
+                    subpixel_features = sub_pixels
+                    coverage_bands = band_arrays
+                    coverage_row_cols = (row_idx, col)
+                    found_coverage = True
+                    break
 
-        if in_bounds and len(feat_vector) == num_bands_expected:
-            intensities = feat_vector
-            break
-
-    if intensities is None:
-        print("[WARNING] No valid raster coverage or mismatch.")
+    if not found_coverage or not subpixel_features:
+        print("[WARNING] No valid coverage for sub-pixel approach.")
         return
 
-    # Scale + Predict
-    intensities_scaled = scaler.transform([intensities])[0]
-    rf_pred = rf_model.predict([intensities_scaled])[0]
-    xgb_pred = xgb_model.predict([intensities_scaled])[0]
+    # Optional: display the area (just a single red dot at center)
+    # For debugging
+    # We'll pass row_cols as a single list of coords (one per band, same center).
+    row_cols_list = []
+    for i in range(num_bands_expected):
+        row_cols_list.append((coverage_row_cols[0], coverage_row_cols[1]))
 
-    print(f"[RandomForest] Predicted Depth: {rf_pred:.4f}")
-    print(f"[XGBoost]     Predicted Depth: {xgb_pred:.4f}")
+    display_cropped_bands(coverage_bands, row_cols_list, radius=radius)
+
+    # Now sub-pixel_features is many lines of shape [n_bands].
+    # We scale & predict each sub-pixel
+    subpixel_features = np.array(subpixel_features)
+    subpixel_scaled = scaler.transform(subpixel_features)
+
+    preds_rf = rf_model.predict(subpixel_scaled)
+    preds_xgb = xgb_model.predict(subpixel_scaled)
+
+    # final = average
+    final_rf = preds_rf.mean()
+    final_xgb = preds_xgb.mean()
+
+    print("[RANDOM FOREST] Sub-pixel predictions => final=%.4f" % final_rf)
+    print("[XGBOOST]       Sub-pixel predictions => final=%.4f" % final_xgb)
 
     if actual_depth is not None:
-        mae_rf = mean_absolute_error([actual_depth], [rf_pred])
-        mae_xgb = mean_absolute_error([actual_depth], [xgb_pred])
-        print(f"[RandomForest] MAE: {mae_rf:.4f}")
-        print(f"[XGBoost]     MAE: {mae_xgb:.4f}")
-
+        mae_rf = mean_absolute_error([actual_depth], [final_rf])
+        mae_xgb = mean_absolute_error([actual_depth], [final_xgb])
+        print("[RandomForest] MAE:", mae_rf)
+        print("[XGBoost]     MAE:", mae_xgb)
         if naive_depth is not None:
             mae_naive = mean_absolute_error([actual_depth], [naive_depth])
-            print(f"[BENCHMARK - AvgDepth]  Predicted Depth: {naive_depth:.4f} | MAE: {mae_naive:.4f}")
+            print("[BENCHMARK]   MAE (naive=%.3f): %.3f" % (naive_depth, mae_naive))
 
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
 def main():
     if not check_files_exist():
         return
 
-    # Use bigger patch_size (3 => 7x7 neighborhood, or 5 => 11x11 if you want to overfit more)
-    patch_size = 20
+    radius = 200      # smaller radius instead of 300
+    n_samples = 100    # gather fewer sub-pixels per geometry
 
-    # 1) Decide which rivers to train on vs. test on
-    train_rivers = ["musa", "susve", "verkne"]
-    test_river = "jura"
+    train_rivers = ["musa", "jura", "verkne"]
+    test_river = "susve"
 
-    # 2) Load training data
-    X_train, y_train = load_training_data(train_rivers, patch_size=patch_size)
+    # load training with multi-sub-pixel approach but smaller
+    X_train, y_train = load_training_data(
+        train_rivers,
+        radius=radius,
+        n_samples=n_samples
+    )
     print(f"Training samples: {X_train.shape[0]} | Features/sample: {X_train.shape[1]}")
-
     if len(X_train) == 0:
         print("[ERROR] No training data found.")
         return
 
-    # 3) Train models (overfit style)
-    rf_model, xgb_model, scaler, naive_depth = train_models(X_train, y_train)
+    # Train with smaller n_estimators and a max_depth
+    rf_model, xgb_model, scaler, naive_depth = train_models(X_train, y_train,
+                                                           n_estimators=300,
+                                                           max_depth=20)
 
-    # 4) Load test data
-    combined_gdf, list_of_band_data, list_of_band_info = load_test_data(test_river, patch_size=patch_size)
-    print(f"Test shapefile(s) have {len(combined_gdf)} valid geometries with Depth.")
+    # Load test
+    combined_gdf, list_of_band_data, list_of_band_info = load_test_data(test_river)
+    print("Test shapefile(s) have", len(combined_gdf), "valid Depth geometries.")
 
-    # 5) Predict random points multiple times
-    for i in range(10):
-        print(f"\n--- Random Prediction #{i+1} ---")
-        predict_random_point(
+    # do sub-pixel predictions
+    for i in range(50):
+        predict_random_point_subpixels(
             combined_gdf,
             list_of_band_data,
             list_of_band_info,
             rf_model,
             xgb_model,
             scaler,
-            patch_size=patch_size,
+            radius=radius,
+            n_samples=n_samples,
             naive_depth=naive_depth,
             num_bands_expected=5
         )
 
     print("\nDone.")
+
 
 if __name__ == "__main__":
     main()
