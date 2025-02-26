@@ -1,0 +1,756 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# --------------------------------------------------------------------------
+# 1) CONFIGURATION & DATA
+# --------------------------------------------------------------------------
+BASE_DIR = r"C:\Users\dober\PycharmProjects\RDA_Python\river_data"
+
+river_data = {
+    "jura": [
+        {
+            "shp_file": "Jura-1.01-dv_SHP-230713.shp",
+            "bands": [
+                "Jura-1.01-nir-230713.tif",
+                "Jura-1.01-orto-230713.tif",
+                "Jura-1.01-red_e-230713.tif",
+                "Jura-1.01-red-230713.tif",
+                "Jura-1.01-green-230713.tif"
+            ]
+        },
+        {
+            "shp_file": "Jura-3.24-dv_SHP-230914.shp",
+            "bands": [
+                "Jura-3.24-nir-230914.tif",
+                "Jura-3.24-orto-230914.tif",
+                "Jura-3.24-red_e-230914.tif",
+                "Jura-3.24-red-230914.tif",
+                "Jura-3.24-green-230914.tif"
+            ]
+        }
+    ],
+    "musa": [
+        {
+            "shp_file": "Musa-0.548-dv_SHP-230711.shp",
+            "bands": [
+                "Musa-0.548-nir-230711.tif",
+                "Musa-0.548-orto-230711.tif",
+                "Musa-0.548-red_e-230711.tif",
+                "Musa-0.548-red-230711.tif",
+                "Musa-0.548-green-230711.tif"
+            ]
+        },
+        {
+            "shp_file": "Musa-0.506-dva_SHP-240923.shp",
+            "bands": [
+                "Musa-0.506-nir-240923.tif",
+                "Musa-0.506-orto-240923.tif",
+                "Musa-0.506-red_e-240923.tif",
+                "Musa-0.506-red-240923.tif",
+                "Musa-0.506-green-240923.tif"
+            ]
+        }
+    ],
+    "susve": [
+        {
+            "shp_file": "Susve-0.491-dv_SHP-230922.shp",
+            "bands": [
+                "Susve-0.491-nir-230922.tif",
+                "Susve-0.491-orto-230922.tif",
+                "Susve-0.491-red-230922.tif",
+                "Susve-0.491-green-230922.tif",
+                "Susve-0.491-red_e-230922.tif"
+            ]
+        },
+        {
+            "shp_file": "Susve-0.697-dva_SHP-240626.shp",
+            "bands": [
+                "Susve-0.697-nir-240626.tif",
+                "Susve-0.697-orto-240626.tif",
+                "Susve-0.697-red-240626.tif",
+                "Susve-0.697-green-240626.tif",
+                "Susve-0.697-red_e-240626.tif"
+            ]
+        }
+    ],
+    "verkne": [
+        {
+            "shp_file": "Verkne-1.42-dv_SHP-230718.shp",
+            "bands": [
+                "Verkne-1.42-nir-230718.tif",
+                "Verkne-1.42-orto-230718.tif",
+                "Verkne-1.42-red_e-230718.tif",
+                "Verkne-1.42-red-230718.tif",
+                "Verkne-1.42-green-230718.tif"
+            ]
+        }
+    ]
+}
+
+# If NDVI is not helping, keep it disabled:
+NIR_INDEX = 0
+RED_INDEX = 3
+
+# --------------------------------------------------------------------------
+def check_files_exist():
+    missing_files = False
+    for rv, datasets in river_data.items():
+        for ds in datasets:
+            shp_path = os.path.join(BASE_DIR, f"data_{rv}", ds["shp_file"])
+            if not os.path.isfile(shp_path):
+                print(f"[WARN] Missing shapefile {shp_path}")
+                missing_files = True
+            for bfile in ds["bands"]:
+                bpath = os.path.join(BASE_DIR, f"data_{rv}", bfile)
+                if not os.path.isfile(bpath):
+                    print(f"[WARN] Missing band {bpath}")
+                    missing_files = True
+    if missing_files:
+        print("[ERROR] Some files are missing.")
+        return False
+    print("[INFO] All required files found.")
+    return True
+
+def clamp_depth(d):
+    """Skip out-of-range depths or clamp them."""
+    if d < 0.0 or d > 0.9:
+        return None
+    return d
+
+def compute_pixel_size(transform):
+    sx = abs(transform.a)
+    sy = abs(transform.e)
+    return (sx + sy)/2.0
+
+def brightness_feature(feats):
+    return sum(feats)/ len(feats)
+
+# --------------------------------------------------------------------------
+#  Sub-Pixel for RF/XGB
+# --------------------------------------------------------------------------
+def collect_subpixels_meter(band_arrays, row_center, col_center,
+                            px_size, radius_m=0.3, n_samples=100):
+    import random
+    rad_px= int(round(radius_m/px_size))
+    if rad_px<1: rad_px=1
+    rows, cols= band_arrays[0].shape
+
+    rmin= max(0, row_center-rad_px)
+    rmax= min(rows, row_center+ rad_px+1)
+    cmin= max(0, col_center-rad_px)
+    cmax= min(cols, col_center+ rad_px+1)
+    box_h= rmax-rmin
+    box_w= cmax-cmin
+    total_px= box_h* box_w
+    if total_px<= n_samples:
+        idxs= [(r,c) for r in range(rmin, rmax) for c in range(cmin,cmax)]
+    else:
+        idxs=[]
+        for _ in range(n_samples):
+            rr= random.randint(rmin,rmax-1)
+            cc= random.randint(cmin,cmax-1)
+            idxs.append((rr, cc))
+
+    results=[]
+    for (rr,cc) in idxs:
+        sp=[]
+        for bd in band_arrays:
+            if 0<=rr<bd.shape[0] and 0<=cc< bd.shape[1]:
+                sp.append(float(bd[rr, cc]))
+            else:
+                sp=[]
+                break
+        if len(sp)== len(band_arrays):
+            results.append(sp)
+    return results
+
+def load_training_data_meters(rivers, radius_m=0.3, n_samples=100, use_ndvi=False):
+    import geopandas as gpd
+    import rasterio
+    X, Y= [], []
+
+    for rv in rivers:
+        for ds in river_data.get(rv, []):
+            shp_path= os.path.join(BASE_DIR, f"data_{rv}", ds["shp_file"])
+            if not os.path.isfile(shp_path):
+                continue
+            gdf= gpd.read_file(shp_path)
+            if "Depth" not in gdf.columns:
+                continue
+            gdf["Depth"]= gdf["Depth"].apply(clamp_depth)
+            valid= gdf[gdf["Depth"].notnull()]
+            if valid.empty:
+                continue
+
+            band_arrays=[]
+            transforms=[]
+            for bfile in ds["bands"]:
+                bpath= os.path.join(BASE_DIR, f"data_{rv}", bfile)
+                if not os.path.isfile(bpath):
+                    continue
+                with rasterio.open(bpath) as src:
+                    band_arrays.append(src.read(1))
+                    transforms.append(src.transform)
+            if not band_arrays:
+                continue
+            px_size= compute_pixel_size(transforms[0])
+
+            for _, rowd in valid.iterrows():
+                d= rowd["Depth"]
+                if d is None:
+                    continue
+                geom= rowd.geometry
+                if not geom or geom.is_empty or geom.geom_type!='Point':
+                    continue
+                x, ypt= geom.x, geom.y
+                ccol, rrow= ~transforms[0]*(x,ypt)
+                rrow, ccol= int(round(rrow)), int(round(ccol))
+                subp= collect_subpixels_meter(band_arrays, rrow, ccol, px_size, radius_m, n_samples)
+                for sp in subp:
+                    bright= brightness_feature(sp)
+                    X.append(sp + [bright])  # 6 features
+                    Y.append(d)
+    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
+
+def train_rf_xgb(X, Y, n_estimators=300, max_depth=20):
+    from sklearn.preprocessing import StandardScaler
+    naive_depth= float(Y.mean())
+    print(f"[RF/XGB] Train set mean depth = {naive_depth:.3f}")
+
+    sc= StandardScaler()
+    Xs= sc.fit_transform(X)
+
+    rf= RandomForestRegressor(
+        n_estimators= n_estimators,
+        max_depth= max_depth,
+        n_jobs=-1,
+        random_state=42
+    )
+    rf.fit(Xs, Y)
+
+    xgb_model= xgb.XGBRegressor(
+        objective='reg:squarederror',
+        max_depth= max_depth,
+        learning_rate=0.005,
+        n_estimators= n_estimators,
+        tree_method='hist',
+        subsample=1.0,
+        colsample_bytree=1.0,
+        random_state=42,
+        n_jobs=-1
+    )
+    xgb_model.fit(Xs, Y)
+
+    return rf, xgb_model, sc, naive_depth
+
+# --------------------------------------------------------------------------
+# Load test
+# --------------------------------------------------------------------------
+def load_test_data(river):
+    import geopandas as gpd
+    import rasterio
+    combined= gpd.GeoDataFrame()
+    list_data=[]
+    list_info=[]
+    if river not in river_data:
+        return combined, list_data, list_info
+
+    for ds in river_data[river]:
+        shp_path= os.path.join(BASE_DIR, f"data_{river}", ds["shp_file"])
+        if not os.path.isfile(shp_path):
+            continue
+        gdf= gpd.read_file(shp_path)
+        if "Depth" not in gdf.columns:
+            valid= gdf
+        else:
+            gdf["Depth"]= gdf["Depth"].apply(clamp_depth)
+            valid= gdf[gdf["Depth"].notnull()]
+        if not valid.empty:
+            combined= pd.concat([combined, valid], ignore_index=True)
+
+        band_arrays=[]
+        band_info=[]
+        for bfile in ds["bands"]:
+            bpath= os.path.join(BASE_DIR, f"data_{river}", bfile)
+            if not os.path.isfile(bpath):
+                continue
+            with rasterio.open(bpath) as src:
+                band_arrays.append(src.read(1))
+                band_info.append((src.transform, src.width, src.height))
+        if band_arrays:
+            list_data.append(band_arrays)
+            list_info.append(band_info)
+    if not combined.empty:
+        combined= gpd.GeoDataFrame(combined, geometry="geometry", crs=gdf.crs)
+
+    return combined, list_data, list_info
+
+# --------------------------------------------------------------------------
+# PATCH-BASED => bigger patch radius + data augmentation
+# --------------------------------------------------------------------------
+class WeightedHuberLoss(tf.keras.losses.Loss):
+    """
+    Weighted Huber: penalize shallow depths more strongly
+    e.g., if Depth < shallow_thresh => double the loss
+    """
+    def __init__(self, shallow_thresh=0.3, shallow_weight=2.0, delta=0.1, name="weighted_huber"):
+        super().__init__(name=name)
+        self.shallow_thresh= shallow_thresh
+        self.shallow_weight= shallow_weight
+        self.delta= delta
+
+    def call(self, y_true, y_pred):
+        residual= y_true - y_pred
+        abs_res= tf.abs(residual)
+        mask= tf.cast(abs_res <= self.delta, dtype=tf.float32)
+        huber= 0.5* tf.square(residual)* mask + self.delta*(abs_res - 0.5*self.delta)*(1.0- mask)
+
+        # approximate approach => if y_true < 0 => treat as shallow
+        shallow_mask= tf.cast(y_true < 0.0, tf.float32)
+        huber_weighted= huber*(1.0 + shallow_mask*(self.shallow_weight - 1.0))
+        return tf.reduce_mean(huber_weighted)
+
+def random_flip_rotate_brightness(patch_4d):
+    """
+    Data augmentation to help with small variations.
+    We'll keep brightness factor smaller to avoid large distortions.
+
+    FIX: Convert to float32 to avoid casting errors
+    """
+    import random
+
+    # Make sure we have float for in-place multiplication
+    out = patch_4d.astype(np.float32, copy=True)
+
+    # random flips
+    if random.random() < 0.5:
+        out = np.flipud(out)
+    if random.random() < 0.5:
+        out = np.fliplr(out)
+    # rotate up to 3 times 90 deg
+    k = random.randint(0, 3)
+    out = np.rot90(out, k, axes=(0, 1))
+
+    # brightness scale 1 ± 0.05 (smaller changes)
+    factor = 1.0 + (random.random() - 0.5) * 0.1
+    raw_channels = min(5, out.shape[-1])  # only raw bands
+    out[:, :, :raw_channels] *= factor
+
+    return out
+
+def patchify(band_arrays, rmin, rmax, cmin, cmax):
+    raw_bands=[]
+    for bd in band_arrays:
+        raw_bands.append(bd[rmin:rmax, cmin:cmax])
+    patch_3d= np.stack(raw_bands, axis=-1)
+    return patch_3d
+
+def load_training_data_patches_nn(
+    rivers,
+    patch_radius_px=6,
+    do_augment=True,
+    use_ndvi=False
+):
+    import geopandas as gpd
+    import rasterio
+    patches=[]
+    depths=[]
+    for rv in rivers:
+        for ds in river_data.get(rv, []):
+            shp_path= os.path.join(BASE_DIR, f"data_{rv}", ds["shp_file"])
+            if not os.path.isfile(shp_path):
+                continue
+            gdf= gpd.read_file(shp_path)
+            if "Depth" not in gdf.columns:
+                continue
+            gdf["Depth"]= gdf["Depth"].apply(clamp_depth)
+            valid= gdf[gdf["Depth"].notnull()]
+            if valid.empty:
+                continue
+
+            band_arrays=[]
+            transforms=[]
+            for bfile in ds["bands"]:
+                bpath= os.path.join(BASE_DIR, f"data_{rv}", bfile)
+                if not os.path.isfile(bpath):
+                    continue
+                with rasterio.open(bpath) as src:
+                    band_arrays.append(src.read(1))
+                    transforms.append(src.transform)
+            if not band_arrays:
+                continue
+            H, W= band_arrays[0].shape
+            t0= transforms[0]
+
+            for _, rowd in valid.iterrows():
+                d= rowd["Depth"]
+                if d is None:
+                    continue
+                geom= rowd.geometry
+                if not geom or geom.is_empty or geom.geom_type!='Point':
+                    continue
+                x, ypt= geom.x, geom.y
+                ccol, rrow= ~t0*(x,ypt)
+                rrow, ccol= int(round(rrow)), int(round(ccol))
+
+                rmin= rrow- patch_radius_px
+                rmax= rrow+ patch_radius_px+1
+                cmin= ccol- patch_radius_px
+                cmax= ccol+ patch_radius_px+1
+                if rmin<0 or rmax>H or cmin<0 or cmax>W:
+                    continue
+                patch_3d= patchify(band_arrays, rmin,rmax,cmin,cmax)
+
+                if use_ndvi:
+                    nir_2d= patch_3d[...,0]
+                    red_2d= patch_3d[...,3]
+                    denom= (nir_2d+ red_2d)+1e-9
+                    ndvi_2d= (nir_2d- red_2d)/ denom
+                    patch_4d= np.concatenate([patch_3d, ndvi_2d[..., np.newaxis]], axis=-1)
+                else:
+                    patch_4d= patch_3d
+
+                if do_augment:
+                    patch_4d= random_flip_rotate_brightness(patch_4d)
+
+                patches.append(patch_4d)
+                depths.append(d)
+
+    return np.array(patches, dtype=np.float32), np.array(depths, dtype=np.float32)
+
+def lr_scheduler(epoch, lr):
+    if epoch>0 and epoch%10==0:
+        return lr*0.5
+    return lr
+
+def build_cnn1(input_shape, custom_loss=None):
+    model= keras.Sequential([
+        layers.Conv2D(32,(3,3), activation='relu', padding='same', input_shape=input_shape),
+        layers.MaxPooling2D(2),
+        layers.Conv2D(64,(3,3), activation='relu', padding='same'),
+        layers.MaxPooling2D(2),
+        layers.Flatten(),
+        layers.Dense(128, activation='relu'),
+        layers.Dropout(0.2),
+        layers.Dense(1, activation='linear')
+    ])
+    opt= keras.optimizers.Adam(learning_rate=5e-4)
+    if custom_loss is None:
+        custom_loss='mse'
+    model.compile(optimizer=opt, loss=custom_loss)
+    return model
+
+def build_cnn2(input_shape, custom_loss=None):
+    inp= keras.Input(shape=input_shape)
+    x= layers.Conv2D(32,(3,3), activation='relu', padding='same')(inp)
+    x= layers.Dropout(0.2)(x)
+    x= layers.Conv2D(32,(3,3), activation='relu', padding='same')(x)
+    x= layers.MaxPooling2D(2)(x)
+    x= layers.Conv2D(64,(3,3), activation='relu', padding='same')(x)
+    x= layers.Dropout(0.2)(x)
+    x= layers.Conv2D(64,(3,3), activation='relu', padding='same')(x)
+    x= layers.MaxPooling2D(2)(x)
+    x= layers.Flatten()(x)
+    x= layers.Dense(256, activation='relu')(x)
+    x= layers.Dropout(0.3)(x)
+    out= layers.Dense(1, activation='linear')(x)
+
+    model= keras.Model(inp, out)
+    opt= keras.optimizers.Adam(learning_rate=1e-4)
+    if custom_loss is None:
+        custom_loss='mae'
+    model.compile(optimizer=opt, loss=custom_loss)
+    return model
+
+def build_transformer(input_shape, custom_loss=None):
+    h,w,c= input_shape
+    num_patches= h*w
+    inp= keras.Input(shape=input_shape)
+    x= layers.Reshape((num_patches, c))(inp)
+    projection_dim=128
+    x= layers.Dense(projection_dim)(x)
+
+    for _ in range(6):
+        attn= layers.MultiHeadAttention(num_heads=8, key_dim=projection_dim)(x,x)
+        x= layers.Add()([x, attn])
+        x= layers.LayerNormalization()(x)
+        ff= layers.Dense(projection_dim*4, activation='relu')(x)
+        ff= layers.Dense(projection_dim)(ff)
+        x= layers.Add()([x, ff])
+        x= layers.LayerNormalization()(x)
+
+    x= layers.GlobalAveragePooling1D()(x)
+    x= layers.Dense(128, activation='relu')(x)
+    x= layers.Dropout(0.2)(x)
+    out= layers.Dense(1, activation='linear')(x)
+
+    model= keras.Model(inp, out)
+    opt= keras.optimizers.Adam(learning_rate=1e-4)
+    if custom_loss is None:
+        custom_loss='mae'
+    model.compile(optimizer=opt, loss=custom_loss)
+    return model
+
+def train_patch_model(X_patches, Y_vals, build_fn,
+                      epochs=50, batch_size=32, custom_loss=None):
+    if len(X_patches)==0:
+        return None, None
+
+    N,h,w,c= X_patches.shape
+    arr= X_patches.reshape((N,-1))
+    mean_x= arr.mean(axis=0)
+    std_x= arr.std(axis=0)+1e-7
+    arr_scaled= (arr- mean_x)/ std_x
+    X_scaled= arr_scaled.reshape((N,h,w,c))
+
+    mean_y= Y_vals.mean()
+    std_y= Y_vals.std()+1e-7
+    Y_scaled= (Y_vals- mean_y)/ std_y
+
+    model= build_fn((h,w,c), custom_loss)
+    callbacks= [
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            restore_best_weights=True
+        ),
+        keras.callbacks.LearningRateScheduler(lr_scheduler)
+    ]
+
+    model.fit(
+        X_scaled, Y_scaled,
+        epochs= epochs,
+        batch_size= batch_size,
+        validation_split=0.2,
+        verbose=1,
+        callbacks=callbacks
+    )
+    stats={
+        "mean_x": mean_x,
+        "std_x": std_x,
+        "mean_y": mean_y,
+        "std_y": std_y
+    }
+    return model, stats
+
+def predict_patch(model, stats, patch_4d):
+    if model is None or stats is None:
+        return None
+    h,w,c= patch_4d.shape
+    arr= patch_4d.reshape((1,-1))
+    arr= (arr- stats["mean_x"])/ stats["std_x"]
+    arr_reshaped= arr.reshape((1,h,w,c))
+    pred_s= model.predict(arr_reshaped)
+    val_s= float(pred_s[0,0])
+    val= val_s* stats["std_y"]+ stats["mean_y"]
+    return val
+
+# --------------------------------------------------------------------------
+# PREDICT ALL
+# --------------------------------------------------------------------------
+def predict_all_models_on_random_point(
+    gdf, list_bands, list_info,
+    rf_model, xgb_model, rf_scaler, naive_depth,
+    cnn1, stats1,
+    cnn2, stats2,
+    vit, stats_vit,
+    radius_m=0.3,
+    n_samples=100,
+    patch_radius_px=6
+):
+    if gdf.empty:
+        return
+    row= gdf.sample(n=1).iloc[0]
+    if not row.geometry or row.geometry.is_empty:
+        return
+    x_c, y_c= row.geometry.x, row.geometry.y
+    actual_d= row["Depth"]
+    if actual_d is None:
+        return
+
+    print("\n=== RANDOM TEST POINT ===")
+    print(f"Coords=({x_c:.3f},{y_c:.3f}), Depth={actual_d:.3f}")
+
+    # 1) Subpixel => RF/XGB
+    coverage_found= False
+    best_bands= None
+    rr= None
+    cc= None
+
+    for band_arrays, band_info in zip(list_bands, list_info):
+        transform_1, w_1, h_1= band_info[0]
+        ccc, rrr= ~transform_1*(x_c, y_c)
+        rrr, ccc= int(round(rrr)), int(round(ccc))
+        if 0<=rrr< h_1 and 0<=ccc< w_1:
+            px_size= compute_pixel_size(transform_1)
+            subp= collect_subpixels_meter(
+                band_arrays, rrr, ccc, px_size,
+                radius_m= radius_m, n_samples= n_samples
+            )
+            if subp:
+                coverage_found= True
+                best_bands= band_arrays
+                rr, cc= rrr, ccc
+                break
+
+    if coverage_found:
+        feats_list=[]
+        for sp in subp:
+            bright= brightness_feature(sp)
+            feats_list.append(sp+ [bright])
+        arr= np.array(feats_list, dtype=np.float32)
+        scaled= rf_scaler.transform(arr)
+        p_rf= rf_model.predict(scaled)
+        p_xg= xgb_model.predict(scaled)
+        mean_rf= p_rf.mean()
+        mean_xg= p_xg.mean()
+        mae_rf= abs(mean_rf- actual_d)
+        mae_xg= abs(mean_xg- actual_d)
+        mae_nv= abs(naive_depth- actual_d)
+        print(f"[RF final]={mean_rf:.3f}, MAE(RF)={mae_rf:.3f}")
+        print(f"[XGB final]={mean_xg:.3f}, MAE(XGB)={mae_xg:.3f}")
+        print(f"[Naive={naive_depth:.3f}] => MAE={mae_nv:.3f}")
+    else:
+        print("[RF/XGB coverage not found.]")
+
+    # 2) Patch => CNN/Transformer
+    patch_4d=None
+    if coverage_found and best_bands is not None:
+        rmin= rr- patch_radius_px
+        rmax= rr+ patch_radius_px+1
+        cmin= cc- patch_radius_px
+        cmax= cc+ patch_radius_px+1
+        H, W= best_bands[0].shape
+        if rmin<0 or rmax>H or cmin<0 or cmax> W:
+            print("[CNN/Transformer] patch out of bounds => skip")
+        else:
+            raw_bands=[]
+            for bd in best_bands:
+                raw_bands.append(bd[rmin:rmax, cmin:cmax])
+            patch_3d= np.stack(raw_bands, axis=-1)
+            patch_4d= patch_3d
+
+    if patch_4d is None:
+        print("[No patch => skip CNN/Transformer preds]")
+        return
+
+    if cnn1 and stats1:
+        c1= predict_patch(cnn1, stats1, patch_4d)
+        if c1 is not None:
+            mae1= abs(c1- actual_d)
+            print(f"[CNN1 pred={c1:.3f}] => AbsErr={mae1:.3f}")
+
+    if cnn2 and stats2:
+        c2= predict_patch(cnn2, stats2, patch_4d)
+        if c2 is not None:
+            mae2= abs(c2- actual_d)
+            print(f"[CNN2 pred={c2:.3f}] => AbsErr={mae2:.3f}")
+
+    if vit and stats_vit:
+        vt= predict_patch(vit, stats_vit, patch_4d)
+        if vt is not None:
+            mae3= abs(vt- actual_d)
+            print(f"[Transformer pred={vt:.3f}] => AbsErr={mae3:.3f}")
+
+# --------------------------------------------------------------------------
+def main():
+    if not check_files_exist():
+        return
+
+    train_rivers= ["susve", "musa", "jura"]
+    test_river= "verkne"
+
+    # 1) TRAIN RF + XGB
+    X_tab, Y_tab= load_training_data_meters(
+        train_rivers,
+        radius_m=0.3,
+        n_samples=100,
+        use_ndvi=False
+    )
+    print("Tabular subpixel data shape:", X_tab.shape, Y_tab.shape)
+    if len(X_tab)==0:
+        print("[ERROR] no subpixel training data.")
+        return
+    rf_model, xgb_model, tab_scaler, naive_d= train_rf_xgb(
+        X_tab, Y_tab,
+        n_estimators=300,
+        max_depth=20
+    )
+
+    # 2) LOAD PATCH DATA => bigger patch => 13x13
+    patch_r= 6
+    patch_array, depth_array= load_training_data_patches_nn(
+        train_rivers,
+        patch_radius_px= patch_r,
+        do_augment=True,
+        use_ndvi=False
+    )
+    print("Patch data shape:", patch_array.shape, depth_array.shape)
+    if len(patch_array)==0:
+        print("[ERROR] no patch data => skip CNN/Transformer")
+        cnn1_model= None; stats1=None
+        cnn2_model= None; stats2=None
+        vit_model= None; stats_vit= None
+    else:
+        # CNN1 => normal MSE
+        cnn1_model, stats1= train_patch_model(
+            patch_array, depth_array,
+            build_cnn1,
+            epochs=50,
+            batch_size=32,
+            custom_loss='mse'
+        )
+
+        # Weighted Huber focusing shallow
+        shallow_loss= WeightedHuberLoss(shallow_thresh=0.3, shallow_weight=2.0, delta=0.1)
+        cnn2_model, stats2= train_patch_model(
+            patch_array, depth_array,
+            build_cnn2,
+            epochs=50,
+            batch_size=32,
+            custom_loss=shallow_loss
+        )
+        vit_model, stats_vit= train_patch_model(
+            patch_array, depth_array,
+            build_transformer,
+            epochs=50,
+            batch_size=32,
+            custom_loss=shallow_loss
+        )
+
+    # 3) LOAD TEST
+    test_gdf, list_bands, list_info= load_test_data(test_river)
+    print("Test shapefile(s) have", len(test_gdf), "valid Depth points")
+
+    # 4) Evaluate e.g. 30 random points => all models
+    for i in range(30):
+        predict_all_models_on_random_point(
+            test_gdf, list_bands, list_info,
+            rf_model, xgb_model, tab_scaler, naive_d,
+            cnn1_model, stats1,
+            cnn2_model, stats2,
+            vit_model, stats_vit,
+            radius_m=0.3,
+            n_samples=100,
+            patch_radius_px= patch_r
+        )
+
+    print("[DONE]")
+
+
+if __name__=="__main__":
+    main()
